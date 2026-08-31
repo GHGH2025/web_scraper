@@ -1,0 +1,5 @@
+playwright
+python-dotenv
+pymongo
+apscheduler>=3.10,<4
+tzdata
