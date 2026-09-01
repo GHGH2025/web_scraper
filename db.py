@@ -33,7 +33,7 @@ SOURCE = "florida_off_market"
 
 _ADDR_TAIL_RE = re.compile(
     r"^(?P<street>.+?),\s*(?P<city>.+?),\s*(?P<state>[A-Za-z]{2})"
-    r"(?:\s+(?P<zip>\d{5}(?:-\d{4})?))?\s*$"
+    r"(?:,?\s+(?P<zip>\d{5}(?:-\d{4})?))?\s*$"
 )
 
 _client: MongoClient | None = None
@@ -85,7 +85,7 @@ def ping() -> None:
 
 def ensure_indexes() -> None:
     raw = get_raw_collection()
-    raw.create_index([("listing_id", ASCENDING)], unique=True, name="uniq_listing_id")
+    raw.create_index([("source", ASCENDING), ("listing_id", ASCENDING)], unique=True, name="uniq_source_listing_id")
     raw.create_index([("updated_at", ASCENDING)], name="raw_updated_at_idx")
 
     filtered = get_filtered_collection()
@@ -136,11 +136,13 @@ def parse_listing_location(listing: dict[str, Any]) -> dict[str, str | None]:
     }
 
 
-def _listing_doc(listing: dict[str, Any], now: datetime) -> dict[str, Any]:
+def _listing_doc(listing: dict[str, Any], now: datetime, source: str) -> dict[str, Any]:
     loc = parse_listing_location(listing)
     doc = dict(listing)
     doc.pop("_id", None)
-    doc["source"] = SOURCE
+    doc["source"] = source
+    doc["source_website"] = source
+    doc["source_listing_id"] = f"{source}:{listing.get('listing_id') or ''}"
     doc["address"] = loc["address"]
     doc["city"] = loc["city"]
     doc["state"] = loc["state"]
@@ -150,7 +152,7 @@ def _listing_doc(listing: dict[str, Any], now: datetime) -> dict[str, Any]:
     return doc
 
 
-def upsert_raw_listings(listings: list[dict[str, Any]]) -> dict[str, int]:
+def upsert_raw_listings(listings: list[dict[str, Any]], *, source: str = SOURCE) -> dict[str, int]:
     now = _now()
     col = get_raw_collection()
     inserted = 0
@@ -162,9 +164,9 @@ def upsert_raw_listings(listings: list[dict[str, Any]]) -> dict[str, int]:
         if not listing_id:
             skipped += 1
             continue
-        doc = _listing_doc(listing, now)
+        doc = _listing_doc(listing, now, source)
         result = col.update_one(
-            {"listing_id": listing_id},
+            {"listing_id": listing_id, "source": source},
             {
                 "$set": {**doc, "updated_at": now},
                 "$setOnInsert": {"created_at": now},
@@ -194,13 +196,14 @@ def upsert_raw_listings(listings: list[dict[str, Any]]) -> dict[str, int]:
     return stats
 
 
-def _filtered_doc(listing: dict[str, Any], loc: dict[str, str | None], raw_id, now: datetime) -> dict[str, Any]:
+def _filtered_doc(listing: dict[str, Any], loc: dict[str, str | None], raw_id, now: datetime, source: str) -> dict[str, Any]:
     snapshot = dict(listing)
     snapshot.pop("_id", None)
     return {
         "listing_id": listing.get("listing_id"),
         "raw_id": str(raw_id) if raw_id is not None else None,
-        "source": SOURCE,
+        "source": source,
+        "source_website": source,
         "address": loc["address"],
         "city": loc["city"],
         "state": loc["state"],
@@ -221,15 +224,31 @@ def _filtered_doc(listing: dict[str, Any], loc: dict[str, str | None], raw_id, n
     }
 
 
-def promote_to_filtered(listings: list[dict[str, Any]]) -> dict[str, int]:
-    """Add raw deals to filtered when the address is new or last posted > 30 days ago."""
+def _recent_address_exists(address: str, address_norm_value: str, since: datetime) -> bool:
+    """Check queue and parsed records from every input source for 30-day history."""
+    db = get_db()
+    if db[FILTERED_COLLECTION].find_one({"address_norm": address_norm_value, "created_at": {"$gte": since}}):
+        return True
+    exact = re.compile(rf"^{re.escape(address)}$", re.I)
+    return bool(
+        db["parsed_listings"].find_one(
+            {
+                "created_at": {"$gte": since},
+                "$or": [{"address": exact}, {"complete_info.address": exact}],
+            },
+            {"_id": 1},
+        )
+    )
+
+
+def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE) -> dict[str, int]:
+    """Queue new web deals only when no same address was created in the last 30 days."""
     now = _now()
     since = now - timedelta(days=LOOKBACK_DAYS)
     raw = get_raw_collection()
     filtered = get_filtered_collection()
     inserted = 0
-    skipped_pending = 0
-    skipped_posted_30d = 0
+    skipped_recent_address = 0
     skipped_no_address = 0
     skipped_no_id = 0
 
@@ -245,43 +264,30 @@ def promote_to_filtered(listings: list[dict[str, Any]]) -> dict[str, int]:
             skipped_no_address += 1
             continue
 
-        if filtered.find_one({"address_norm": key, "status": "pending"}):
-            skipped_pending += 1
+        if _recent_address_exists(loc["address"] or "", key, since):
+            skipped_recent_address += 1
             continue
 
-        recent_posted = filtered.find_one(
-            {
-                "address_norm": key,
-                "status": "posted",
-                "posted_at": {"$gte": since},
-            }
-        )
-        if recent_posted:
-            skipped_posted_30d += 1
-            continue
-
-        raw_doc = raw.find_one({"listing_id": listing_id}, {"_id": 1})
+        raw_doc = raw.find_one({"listing_id": listing_id, "source": source}, {"_id": 1})
         raw_id = raw_doc["_id"] if raw_doc else None
-        filtered.insert_one(_filtered_doc(listing, loc, raw_id, now))
+        filtered.insert_one(_filtered_doc(listing, loc, raw_id, now, source))
         inserted += 1
 
     stats = {
         "inserted": inserted,
-        "skipped_pending": skipped_pending,
-        "skipped_posted_30d": skipped_posted_30d,
+        "skipped_recent_address": skipped_recent_address,
         "skipped_no_address": skipped_no_address,
         "skipped_no_id": skipped_no_id,
         "total": len(listings),
         "lookback_days": LOOKBACK_DAYS,
     }
     log.info(
-        "Mongo filtered %s.%s inserted=%s skipped_pending=%s skipped_posted_30d=%s "
+        "Mongo filtered %s.%s inserted=%s skipped_recent_address=%s "
         "skipped_no_address=%s total=%s",
         get_db().name,
         FILTERED_COLLECTION,
         inserted,
-        skipped_pending,
-        skipped_posted_30d,
+        skipped_recent_address,
         skipped_no_address,
         len(listings),
     )

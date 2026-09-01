@@ -43,8 +43,7 @@ def run_job(
             "raw": empty,
             "filtered": {
                 "inserted": 0,
-                "skipped_pending": 0,
-                "skipped_posted_30d": 0,
+                "skipped_recent_address": 0,
                 "skipped_no_address": 0,
                 "skipped_no_id": 0,
                 "total": 0,

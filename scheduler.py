@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 
 from db import close_client
 from job import JOB_LOG_PATH, run_job
+from rezzie_job import run_job as run_rezzie_job
 from scrape_fom import ROOT, log, setup_logging
 
 load_dotenv(ROOT / ".env")
@@ -34,21 +35,21 @@ def _timezone() -> ZoneInfo:
     return ZoneInfo(name)
 
 
-def _scheduled_job(headed: bool, county: str | None, timeout_ms: int, delay_sec: float) -> None:
-    log.info("Cron fired — starting scrape + extract + raw/filtered Mongo write")
+def _scheduled_job(county: str | None, timeout_ms: int, delay_sec: float) -> None:
+    log.info("Cron fired — starting Florida Off Market and Rezzie headless web jobs")
     run_job(
-        headed=headed,
+        headed=False,
         county=county,
         timeout_ms=timeout_ms,
         delay_sec=delay_sec,
     )
+    run_rezzie_job(timeout_ms=timeout_ms)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="APScheduler cron for the Florida Off Market scrape job")
+    parser = argparse.ArgumentParser(description="APScheduler cron for Florida Off Market and Rezzie web jobs")
     parser.add_argument("--now", action="store_true", help="Run the job once at startup, then keep the 1 AM cron")
     parser.add_argument("--once", action="store_true", help="Run the job once and exit (no scheduler)")
-    parser.add_argument("--headed", action="store_true")
     parser.add_argument("--county", default=None)
     parser.add_argument("--timeout", type=int, default=45000)
     parser.add_argument("--delay", type=float, default=0.6)
@@ -62,8 +63,7 @@ def main() -> None:
 
     if args.once:
         try:
-            run_job(
-                headed=args.headed,
+            _scheduled_job(
                 county=county,
                 timeout_ms=args.timeout,
                 delay_sec=args.delay,
@@ -80,7 +80,6 @@ def main() -> None:
         _scheduled_job,
         CronTrigger(hour=1, minute=0, timezone=tz),
         kwargs={
-            "headed": args.headed,
             "county": county,
             "timeout_ms": args.timeout,
             "delay_sec": args.delay,
@@ -97,8 +96,7 @@ def main() -> None:
     if args.now:
         log.info("--now: running job immediately before waiting for cron")
         try:
-            run_job(
-                headed=args.headed,
+            _scheduled_job(
                 county=county,
                 timeout_ms=args.timeout,
                 delay_sec=args.delay,
