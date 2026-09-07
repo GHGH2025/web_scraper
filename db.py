@@ -140,6 +140,10 @@ def _listing_doc(listing: dict[str, Any], now: datetime, source: str) -> dict[st
     loc = parse_listing_location(listing)
     doc = dict(listing)
     doc.pop("_id", None)
+    # These are managed by the Mongo upsert, not copied from scraper payloads.
+    # Keeping created_at out of $set avoids a $set/$setOnInsert path conflict.
+    doc.pop("created_at", None)
+    doc.pop("updated_at", None)
     doc["source"] = source
     doc["source_website"] = source
     doc["source_listing_id"] = f"{source}:{listing.get('listing_id') or ''}"

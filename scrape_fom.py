@@ -15,6 +15,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
@@ -52,6 +53,36 @@ def setup_logging(log_path: Path) -> None:
     console.setFormatter(fmt)
     log.addHandler(file_handler)
     log.addHandler(console)
+
+
+def _is_fom_host(url: str) -> bool:
+    host = (urlsplit(url or "").netloc or "").lower()
+    return host == "floridaoffmarket.mysharetribe.com"
+
+
+def _is_fom_search_page(page) -> bool:
+    """True only on the FOM marketplace search (or a page that already shows deals)."""
+    url = page.url or ""
+    if not _is_fom_host(url):
+        return False
+    path = (urlsplit(url).path or "").lower().rstrip("/")
+    if path == "/s" or path.startswith("/s/"):
+        return True
+    try:
+        return page.locator('a[href*="/l/"]').count() > 0
+    except Exception:
+        return False
+
+
+def _relogin_with_env(page, email: str, password: str, timeout_ms: int) -> None:
+    """Drop a stale session and sign in again with FOM_EMAIL / FOM_PASSWORD."""
+    log.info("Re-login with env credentials (was at %s)", page.url)
+    page.context.clear_cookies()
+    login_url = f"{BASE_URL}{LOGIN_PATH}"
+    page.goto(login_url, wait_until="domcontentloaded")
+    log.info("Opened login page. URL=%s", page.url)
+    _dismiss_banners(page)
+    _submit_login(page, email, password, timeout_ms)
 
 
 def _search_url(county: str | None = None, page: int = 1) -> str:
@@ -139,6 +170,9 @@ def _submit_login(page, email: str, password: str, timeout_ms: int) -> None:
 
 def _ensure_logged_in(page, email: str, password: str, timeout_ms: int) -> None:
     log.info("Checking login state. URL=%s", page.url)
+    if not _is_fom_host(page.url or ""):
+        _relogin_with_env(page, email, password, timeout_ms)
+        return
     if _login_form_visible(page) or LOGIN_PATH in (page.url or ""):
         log.info("Login form is visible — signing in")
         _submit_login(page, email, password, timeout_ms)
@@ -151,7 +185,7 @@ def _ensure_logged_in(page, email: str, password: str, timeout_ms: int) -> None:
         _dismiss_banners(page)
         _submit_login(page, email, password, timeout_ms)
         return
-    log.info("Already logged in (no login form or Log in link)")
+    log.info("Already logged in on FOM host")
 
 
 def _wait_for_cards(page, timeout_ms: int) -> None:
@@ -246,6 +280,10 @@ def _collect_all_listings(page, county: str | None, timeout_ms: int) -> list[dic
         log.info("Opening search page %s/%s: %s", page_num, total_pages or "?", url)
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         log.info("Search page %s loaded. URL=%s", page_num, page.url)
+        if not _is_fom_host(page.url or ""):
+            raise RuntimeError(
+                f"Search page {page_num} redirected off FOM to {page.url}"
+            )
         _dismiss_banners(page)
         try:
             _wait_for_cards(page, timeout_ms)
@@ -309,14 +347,25 @@ def run(headed: bool, county: str | None, timeout_ms: int, out_path: Path | None
         _dismiss_banners(page)
         _ensure_logged_in(page, email, password, timeout_ms)
 
-        if LISTING_HREF_RE.search(page.url or "") is None and "/s" not in (page.url or ""):
-            log.info("Not on search results after login. Returning to %s", search_url)
+        if not _is_fom_search_page(page):
+            log.info("Not on FOM search after login check. Returning to %s", search_url)
             page.goto(search_url, wait_until="domcontentloaded")
             log.info("Search page loaded. URL=%s", page.url)
             _dismiss_banners(page)
 
-        logged_in = not _has_login_link(page) and not _login_form_visible(page)
-        log.info("Session looks logged_in=%s", logged_in)
+        if not _is_fom_search_page(page):
+            _relogin_with_env(page, email, password, timeout_ms)
+            page.goto(search_url, wait_until="domcontentloaded")
+            log.info("Search page loaded after re-login. URL=%s", page.url)
+            _dismiss_banners(page)
+
+        if not _is_fom_search_page(page):
+            raise RuntimeError(
+                f"Could not reach FOM search after login. URL={page.url}"
+            )
+
+        logged_in = _is_fom_host(page.url or "") and not _login_form_visible(page)
+        log.info("Session looks logged_in=%s url=%s", logged_in, page.url)
         cards, total_pages = _collect_all_listings(page, county, timeout_ms)
         if not cards:
             log.warning("No listing cards extracted")
