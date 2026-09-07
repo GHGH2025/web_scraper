@@ -11,6 +11,11 @@ except ImportError:  # pragma: no cover - exercised by the script-style entry po
     from providers.base import ScraperProvider
 
 
+def _is_auth_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(token in msg for token in ("login", "auth", "sign in", "sign-in", "mfa", "captcha"))
+
+
 class ScraperEngine:
     """Run a provider while keeping browser/session concerns in one place."""
 
@@ -80,6 +85,14 @@ class ScraperEngine:
                     try:
                         extracted.append(self.provider.extract_listing(page, item, self.timeout_ms))
                     except Exception as exc:
+                        if _is_auth_error(exc):
+                            try:
+                                self.provider.authenticate(page, self.timeout_ms)
+                                extracted.append(self.provider.extract_listing(page, item, self.timeout_ms))
+                                continue
+                            except Exception as retry_exc:
+                                extracted.append({**item, "error": str(retry_exc)})
+                                continue
                         extracted.append({**item, "error": str(exc)})
                 return extracted
             finally:

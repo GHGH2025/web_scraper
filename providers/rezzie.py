@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
-import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -13,6 +14,8 @@ from dotenv import load_dotenv
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
 from .base import ScraperProvider
+
+log = logging.getLogger("rezzie")
 
 
 class RezzieProvider(ScraperProvider):
@@ -129,7 +132,9 @@ class RezzieProvider(ScraperProvider):
             if not next_url or next_url in visited or (next_link.get_attribute("aria-disabled") or "").lower() == "true":
                 break
             page.goto(next_url, wait_until="domcontentloaded", timeout=timeout_ms)
-        return list(results.values())
+        cards = list(results.values())
+        self._warn_if_empty(page, cards)
+        return cards
 
     def _collect_button_listings(
         self,
@@ -188,7 +193,19 @@ class RezzieProvider(ScraperProvider):
                 )
             except PlaywrightTimeout:
                 break
-        return list(results.values())
+        cards = list(results.values())
+        self._warn_if_empty(page, cards)
+        return cards
+
+    @staticmethod
+    def _warn_if_empty(page: Any, cards: list[dict[str, Any]]) -> None:
+        if cards:
+            return
+        try:
+            snippet = page.locator("body").inner_text(timeout=3000)[:600]
+        except Exception:
+            snippet = ""
+        log.warning("Rezzie dashboard returned 0 listings url=%s snippet=%s", page.url, snippet)
 
     @staticmethod
     def _write_debug_snapshot(page: Any) -> None:

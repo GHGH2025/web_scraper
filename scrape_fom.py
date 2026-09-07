@@ -29,6 +29,15 @@ PRICE_RE = re.compile(r"\$[\d,]+(?:\.\d{2})?")
 PAGE_HREF_RE = re.compile(r"[?&]page=(\d+)", re.I)
 GO_TO_PAGE_RE = re.compile(r"Go to page\s+(\d+)", re.I)
 RESULTS_RE = re.compile(r"(\d+)\s+results?", re.I)
+LOGIN_LINK_RE = re.compile(r"log\s*in|sign\s*in", re.I)
+LOGIN_CONTROL_RE = re.compile(r"log\s*in|sign\s*in|continue", re.I)
+EMPTY_RESULTS_RE = re.compile(r"\b0\s+results?\b|no (listings|results|deals) (found|match)", re.I)
+BLOCKED_PAGE_RE = re.compile(
+    r"captcha|recaptcha|verify you are human|two[- ]factor|authentication code|"
+    r"confirm (your )?email|invalid password|incorrect password|"
+    r"account (is )?locked|attention required|cloudflare",
+    re.I,
+)
 
 ROOT = Path(__file__).resolve().parent
 SESSION_DIR = ROOT / ".session"
@@ -60,6 +69,16 @@ def _is_fom_host(url: str) -> bool:
     return host == "floridaoffmarket.mysharetribe.com"
 
 
+def login_url_ok(url: str) -> bool:
+    """True only after leaving /login and landing on the FOM marketplace host."""
+    return _is_fom_host(url) and LOGIN_PATH not in (url or "")
+
+
+def _page_block_reason(text: str) -> str | None:
+    match = BLOCKED_PAGE_RE.search(text or "")
+    return match.group(0) if match else None
+
+
 def _is_fom_search_page(page) -> bool:
     """True only on the FOM marketplace search (or a page that already shows deals)."""
     url = page.url or ""
@@ -74,14 +93,41 @@ def _is_fom_search_page(page) -> bool:
         return False
 
 
+def _clear_browser_storage(page) -> None:
+    page.context.clear_cookies()
+    try:
+        page.evaluate("() => { localStorage.clear(); sessionStorage.clear(); }")
+    except Exception as exc:
+        log.debug("Could not clear web storage: %s", exc)
+
+
+def _body_snippet(page, limit: int = 800) -> str:
+    try:
+        return page.inner_text("body", timeout=2000)[:limit]
+    except Exception:
+        return ""
+
+
+def _raise_if_blocked(page) -> None:
+    text = _body_snippet(page)
+    reason = _page_block_reason(text)
+    if reason:
+        raise RuntimeError(
+            f"Login blocked ({reason}). URL={page.url} — check credentials or run --headed.\n{text[:400]}"
+        )
+
+
 def _relogin_with_env(page, email: str, password: str, timeout_ms: int) -> None:
     """Drop a stale session and sign in again with FOM_EMAIL / FOM_PASSWORD."""
     log.info("Re-login with env credentials (was at %s)", page.url)
-    page.context.clear_cookies()
     login_url = f"{BASE_URL}{LOGIN_PATH}"
+    page.context.clear_cookies()
+    page.goto(login_url, wait_until="domcontentloaded")
+    _clear_browser_storage(page)
     page.goto(login_url, wait_until="domcontentloaded")
     log.info("Opened login page. URL=%s", page.url)
     _dismiss_banners(page)
+    _raise_if_blocked(page)
     _submit_login(page, email, password, timeout_ms)
 
 
@@ -130,41 +176,45 @@ def _login_form_visible(page) -> bool:
 
 
 def _has_login_link(page) -> bool:
-    link = page.get_by_role("link", name=re.compile(r"^Log in$", re.I))
+    link = page.get_by_role("link", name=LOGIN_LINK_RE)
     try:
         return link.count() > 0 and link.first.is_visible()
     except Exception:
         return False
 
 
+def _click_login_submit(page) -> None:
+    form = page.locator("form")
+    submit = form.get_by_role("button", name=LOGIN_CONTROL_RE)
+    if submit.count():
+        log.info("Clicking form login button")
+        submit.first.click()
+        return
+    log.info("Clicking page login button")
+    page.get_by_role("button", name=LOGIN_CONTROL_RE).first.click()
+
+
 def _submit_login(page, email: str, password: str, timeout_ms: int) -> None:
     log.info("Filling login form for %s", email)
     page.get_by_label("Email", exact=True).fill(email)
     page.get_by_label("Password", exact=True).fill(password)
-    form = page.locator("form")
-    submit = form.get_by_role("button", name="Log in")
-    if submit.count():
-        log.info("Clicking form Log in button")
-        submit.first.click()
-    else:
-        log.info("Clicking page Log in button")
-        page.get_by_role("button", name="Log in").first.click()
-    log.info("Waiting to leave %s (timeout %sms)", LOGIN_PATH, timeout_ms)
+    _click_login_submit(page)
+    log.info("Waiting for FOM host after login (timeout %sms)", timeout_ms)
     try:
-        page.wait_for_url(lambda url: LOGIN_PATH not in url, timeout=timeout_ms)
+        page.wait_for_url(login_url_ok, timeout=timeout_ms)
     except PlaywrightTimeout:
-        err = ""
-        try:
-            err = page.inner_text("body", timeout=2000)[:400]
-        except Exception:
-            pass
-        log.error("Login did not leave %s. Current URL: %s", LOGIN_PATH, page.url)
+        _raise_if_blocked(page)
+        err = _body_snippet(page, 400)
+        log.error("Login did not reach FOM. Current URL: %s", page.url)
         if err:
             log.error("Page text: %s", err)
         raise RuntimeError(
-            "Still on the login page after submit. Check credentials or run with --headed.\n"
-            f"{err}"
+            "Login did not reach Florida Off Market. Check credentials or run with --headed.\n"
+            f"URL={page.url}\n{err}"
         )
+    _raise_if_blocked(page)
+    if not login_url_ok(page.url or ""):
+        raise RuntimeError(f"Login left /login but is not on FOM. URL={page.url}")
     log.info("Login succeeded. Now at %s", page.url)
 
 
@@ -188,10 +238,27 @@ def _ensure_logged_in(page, email: str, password: str, timeout_ms: int) -> None:
     log.info("Already logged in on FOM host")
 
 
-def _wait_for_cards(page, timeout_ms: int) -> None:
+def _looks_empty_search(page) -> bool:
+    return bool(EMPTY_RESULTS_RE.search(_body_snippet(page) or ""))
+
+
+def _wait_for_search_ready(page, timeout_ms: int) -> bool:
+    """True if listing cards appeared, False if the FOM search is empty."""
     log.info("Waiting for listing cards on %s (timeout %sms)", page.url, timeout_ms)
-    page.locator('a[href*="/l/"]').first.wait_for(state="visible", timeout=timeout_ms)
-    log.info("Listing cards are visible")
+    try:
+        page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 15000))
+    except PlaywrightTimeout:
+        pass
+    cards = page.locator('a[href*="/l/"]')
+    try:
+        cards.first.wait_for(state="visible", timeout=timeout_ms)
+        log.info("Listing cards are visible")
+        return True
+    except PlaywrightTimeout:
+        if _is_fom_search_page(page) and (_looks_empty_search(page) or cards.count() == 0):
+            log.warning("Empty FOM search at %s", page.url)
+            return False
+        raise
 
 
 def _wait_for_pagination(page) -> None:
@@ -271,26 +338,42 @@ def _extract_cards(page) -> list[dict]:
     return list(seen.values())
 
 
-def _collect_all_listings(page, county: str | None, timeout_ms: int) -> list[dict]:
+def _open_search_page(page, url: str, timeout_ms: int, email: str, password: str, page_num: int) -> bool:
+    """Open a search page; re-login once if ShareTribe bounces off FOM. False = give up on this page."""
+    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    log.info("Search page %s loaded. URL=%s", page_num, page.url)
+    if _is_fom_host(page.url or ""):
+        return True
+    log.warning("Search page %s redirected off FOM to %s — re-login", page_num, page.url)
+    _relogin_with_env(page, email, password, timeout_ms)
+    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    log.info("Search page %s after re-login. URL=%s", page_num, page.url)
+    if _is_fom_host(page.url or ""):
+        return True
+    if page_num == 1:
+        raise RuntimeError(f"Search page {page_num} redirected off FOM to {page.url}")
+    log.error("Search page %s still off FOM after re-login (%s); keeping collected cards", page_num, page.url)
+    return False
+
+
+def _collect_all_listings(page, county: str | None, timeout_ms: int, email: str, password: str):
     by_id: dict[str, dict] = {}
     total_pages = None
     page_num = 1
     while True:
         url = _search_url(county, page_num)
         log.info("Opening search page %s/%s: %s", page_num, total_pages or "?", url)
-        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        log.info("Search page %s loaded. URL=%s", page_num, page.url)
-        if not _is_fom_host(page.url or ""):
-            raise RuntimeError(
-                f"Search page {page_num} redirected off FOM to {page.url}"
-            )
+        if not _open_search_page(page, url, timeout_ms, email, password, page_num):
+            break
         _dismiss_banners(page)
         try:
-            _wait_for_cards(page, timeout_ms)
+            has_cards = _wait_for_search_ready(page, timeout_ms)
         except PlaywrightTimeout:
-            if page_num == 1:
+            if page_num == 1 and not _is_fom_search_page(page):
                 raise
             log.info("No cards on page %s — stopping pagination", page_num)
+            break
+        if not has_cards:
             break
         _wait_for_pagination(page)
         cards = _extract_cards(page)
@@ -366,7 +449,7 @@ def run(headed: bool, county: str | None, timeout_ms: int, out_path: Path | None
 
         logged_in = _is_fom_host(page.url or "") and not _login_form_visible(page)
         log.info("Session looks logged_in=%s url=%s", logged_in, page.url)
-        cards, total_pages = _collect_all_listings(page, county, timeout_ms)
+        cards, total_pages = _collect_all_listings(page, county, timeout_ms, email, password)
         if not cards:
             log.warning("No listing cards extracted")
 

@@ -35,6 +35,21 @@ _ADDR_TAIL_RE = re.compile(
     r"^(?P<street>.+?),\s*(?P<city>.+?),\s*(?P<state>[A-Za-z]{2})"
     r"(?:,?\s+(?P<zip>\d{5}(?:-\d{4})?))?\s*$"
 )
+_STREET_RE = re.compile(
+    r"\d{1,6}\s+\S.+\b(?:street|st|avenue|ave|road|rd|drive|dr|lane|ln|"
+    r"blvd|boulevard|way|court|ct|circle|cir|place|pl|terrace|ter|"
+    r"highway|hwy|parkway|pkwy)\b",
+    re.I,
+)
+
+
+def looks_like_street_address(text: str | None) -> bool:
+    line = (text or "").strip().splitlines()[0].strip() if text else ""
+    if not line:
+        return False
+    if _ADDR_TAIL_RE.match(line):
+        return True
+    return bool(_STREET_RE.search(line.split(",")[0]))
 
 _client: MongoClient | None = None
 
@@ -112,17 +127,21 @@ def address_norm(address: str) -> str:
 
 
 def parse_listing_location(listing: dict[str, Any]) -> dict[str, str | None]:
-    """Street/city/state/zip from extract title (FOM H1) plus detail fields."""
-    title = (listing.get("address") or listing.get("title") or "").strip()
+    """Street/city/state/zip from a real address — not a marketing H1."""
+    raw_address = (listing.get("address") or "").strip()
+    title = (listing.get("title") or "").strip()
+    candidate = raw_address if looks_like_street_address(raw_address) else (
+        title if looks_like_street_address(title) else ""
+    )
     city = (listing.get("city") or "").strip() or None
     state = (listing.get("state") or "").strip() or None
     zip_ = (listing.get("zip") or "").strip() or None
-    address = title or None
+    address = candidate or None
 
-    if title:
-        match = _ADDR_TAIL_RE.match(title)
+    if candidate:
+        match = _ADDR_TAIL_RE.match(candidate)
         if match:
-            address = match.group("street").strip() or title
+            address = match.group("street").strip() or candidate
             city = city or (match.group("city") or "").strip() or None
             state = state or (match.group("state") or "").strip() or None
             zip_ = zip_ or (match.group("zip") or "").strip() or None
@@ -253,6 +272,7 @@ def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE)
     filtered = get_filtered_collection()
     inserted = 0
     skipped_recent_address = 0
+    skipped_existing_id = 0
     skipped_no_address = 0
     skipped_no_id = 0
 
@@ -260,6 +280,10 @@ def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE)
         listing_id = listing.get("listing_id")
         if not listing_id:
             skipped_no_id += 1
+            continue
+
+        if filtered.find_one({"listing_id": listing_id, "source": source}, {"_id": 1}):
+            skipped_existing_id += 1
             continue
 
         loc = parse_listing_location(listing)
@@ -280,6 +304,7 @@ def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE)
     stats = {
         "inserted": inserted,
         "skipped_recent_address": skipped_recent_address,
+        "skipped_existing_id": skipped_existing_id,
         "skipped_no_address": skipped_no_address,
         "skipped_no_id": skipped_no_id,
         "total": len(listings),
@@ -287,11 +312,12 @@ def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE)
     }
     log.info(
         "Mongo filtered %s.%s inserted=%s skipped_recent_address=%s "
-        "skipped_no_address=%s total=%s",
+        "skipped_existing_id=%s skipped_no_address=%s total=%s",
         get_db().name,
         FILTERED_COLLECTION,
         inserted,
         skipped_recent_address,
+        skipped_existing_id,
         skipped_no_address,
         len(listings),
     )

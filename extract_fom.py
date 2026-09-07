@@ -12,6 +12,7 @@ from pathlib import Path
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
+from db import looks_like_street_address
 from scrape_fom import (
     BASE_URL,
     DATA_DIR,
@@ -22,7 +23,9 @@ from scrape_fom import (
     STATE_PATH,
     _dismiss_banners,
     _ensure_logged_in,
+    _is_fom_host,
     _load_creds,
+    _relogin_with_env,
     log,
     setup_logging,
 )
@@ -57,6 +60,17 @@ STOP_HEADINGS = [
 
 PHOTO_COUNT_RE = re.compile(r"View large photos\s*\((\d+)\)", re.I)
 PROFILE_RE = re.compile(r"Profile:\s*(.+)", re.I)
+LABEL_PRICE_RE = re.compile(
+    r"(?:asking price|list price|purchase price|price)\s*[:\-]?\s*(\$[\d,]+(?:\.\d{2})?)",
+    re.I,
+)
+SKIP_IMAGE_RE = re.compile(
+    r"facebook\.com|twitter\.com|linkedin\.com|instagram\.com|google-analytics|"
+    r"sharetribe\.com/static|gravatar|favicon|sprite|/logo",
+    re.I,
+)
+# ponytail: earnest/fees under 10k are ignored when a larger asking price exists
+MIN_PROPERTY_PRICE = 10000
 
 
 def _to_number(value: str | None):
@@ -77,6 +91,47 @@ def _price_usd(price_text: str | None):
     if not price_text:
         return None
     return _to_number(price_text)
+
+
+def pick_price_text(*texts: str | None) -> str | None:
+    """Prefer a labeled asking price, then the largest property-sized $ amount."""
+    labeled: list[str] = []
+    amounts: list[str] = []
+    for text in texts:
+        if not text:
+            continue
+        labeled.extend(match.group(1) for match in LABEL_PRICE_RE.finditer(text))
+        amounts.extend(match.group(0) for match in PRICE_RE.finditer(text))
+    if labeled:
+        return labeled[0]
+    property_prices = [price for price in amounts if (_price_usd(price) or 0) >= MIN_PROPERTY_PRICE]
+    if property_prices:
+        return max(property_prices, key=lambda price: _price_usd(price) or 0)
+    return amounts[0] if amounts else None
+
+
+def pick_address(title: str | None, *blobs: str | None) -> str | None:
+    if looks_like_street_address(title):
+        return (title or "").strip()
+    for blob in blobs:
+        for line in (blob or "").splitlines():
+            if looks_like_street_address(line):
+                return line.strip()
+    return None
+
+
+def keep_image_url(src: str, width: str | None = None, height: str | None = None) -> bool:
+    src = (src or "").strip()
+    if not src or src.startswith("data:"):
+        return False
+    if SKIP_IMAGE_RE.search(src):
+        return False
+    try:
+        if width is not None and height is not None and int(width) <= 32 and int(height) <= 32:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return True
 
 
 def _slice_section(text: str, heading: str, stop: list[str]) -> str:
@@ -177,22 +232,40 @@ def _extract_images(page) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
 
-    def _add(src: str) -> None:
+    def _add(src: str, width: str | None = None, height: str | None = None) -> None:
         src = (src or "").strip()
-        if not src or src.startswith("data:"):
-            return
         if src.startswith("//"):
             src = "https:" + src
-        if src not in seen:
-            seen.add(src)
-            urls.append(src)
+        if not keep_image_url(src, width, height) or src in seen:
+            return
+        seen.add(src)
+        urls.append(src)
 
     for img in page.locator("img").all():
-        _add(img.get_attribute("src") or "")
+        width = img.get_attribute("width")
+        height = img.get_attribute("height")
+        _add(img.get_attribute("src") or "", width, height)
         srcset = img.get_attribute("srcset") or ""
         if srcset:
-            _add(srcset.split(",")[0].strip().split(" ")[0])
+            _add(srcset.split(",")[0].strip().split(" ")[0], width, height)
     return urls
+
+
+def _is_fom_listing_page(page) -> bool:
+    url = page.url or ""
+    if not _is_fom_host(url):
+        return False
+    if LISTING_HREF_RE.search(url):
+        return True
+    try:
+        return page.get_by_role("heading", name="Details").count() > 0
+    except Exception:
+        return False
+
+
+def _session_expired(page) -> bool:
+    url = page.url or ""
+    return LOGIN_PATH in url or not _is_fom_host(url)
 
 
 def _extract_deal(page, job: dict, timeout_ms: int) -> dict:
@@ -200,8 +273,10 @@ def _extract_deal(page, job: dict, timeout_ms: int) -> dict:
     log.info("Opening deal %s", url)
     page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
     _dismiss_banners(page)
-    if LOGIN_PATH in (page.url or ""):
-        raise RuntimeError("Redirected to login — session expired")
+    if _session_expired(page):
+        raise RuntimeError(f"Redirected off FOM listing — session expired ({page.url})")
+    if not _is_fom_listing_page(page):
+        raise RuntimeError(f"Not a FOM listing page: {page.url}")
 
     try:
         page.get_by_role("heading", name="Details").first.wait_for(state="visible", timeout=timeout_ms)
@@ -229,6 +304,7 @@ def _extract_deal(page, job: dict, timeout_ms: int) -> dict:
     details = _parse_details(details_blob)
     transaction_type = _parse_multi_values(_slice_section(main_text, "Transaction Type", STOP_HEADINGS))
     payment_methods = _parse_multi_values(_slice_section(main_text, "Payment Methods", STOP_HEADINGS))
+    location_blob = _slice_section(main_text, "Location", STOP_HEADINGS)
 
     description = ""
     details_match = re.search(r"(?im)^[ \t]*Details[ \t]*$", main_text)
@@ -239,8 +315,7 @@ def _extract_deal(page, job: dict, timeout_ms: int) -> dict:
             raw_desc = raw_desc.replace(title, "", 1)
         description = re.sub(r"\n{3,}", "\n\n", raw_desc).strip()
 
-    price_match = PRICE_RE.search(main_text or "")
-    price_text = price_match.group(0) if price_match else job.get("card_price") or job.get("price")
+    price_text = pick_price_text(main_text) or job.get("card_price") or job.get("price")
 
     photo_match = PHOTO_COUNT_RE.search(main_text or "")
     photo_count = int(photo_match.group(1)) if photo_match else None
@@ -263,7 +338,7 @@ def _extract_deal(page, job: dict, timeout_ms: int) -> dict:
         "listing_id": listing_id,
         "url": page.url or url,
         "title": title,
-        "address": title,
+        "address": pick_address(title, location_blob, description),
         "price": price_text,
         "price_usd": _price_usd(price_text),
         "description": description or None,
@@ -357,9 +432,21 @@ def run(
                 _merge_extracted(listing, extracted)
                 ok += 1
             except Exception as exc:
-                failed += 1
-                listing["error"] = str(exc)
-                log.exception("Failed to extract %s: %s", url, exc)
+                if "session expired" in str(exc).lower():
+                    log.warning("Session expired on %s — re-login and retry once", url)
+                    try:
+                        _relogin_with_env(page, email, password, timeout_ms)
+                        extracted = _extract_deal(page, listing, timeout_ms)
+                        _merge_extracted(listing, extracted)
+                        ok += 1
+                    except Exception as retry_exc:
+                        failed += 1
+                        listing["error"] = str(retry_exc)
+                        log.exception("Failed to extract %s after re-login: %s", url, retry_exc)
+                else:
+                    failed += 1
+                    listing["error"] = str(exc)
+                    log.exception("Failed to extract %s: %s", url, exc)
             if out_path is not None:
                 _write_payload(
                     out_path,

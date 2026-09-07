@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -28,6 +29,7 @@ load_dotenv(ROOT / ".env")
 
 DEFAULT_TZ = "America/New_York"
 SCHEDULER_LOG_PATH = Path(__file__).resolve().parent / "logs" / "scheduler.log"
+RETRY_SLEEP_SEC = 60
 
 
 def _timezone() -> ZoneInfo:
@@ -35,15 +37,31 @@ def _timezone() -> ZoneInfo:
     return ZoneInfo(name)
 
 
-def _scheduled_job(county: str | None, timeout_ms: int, delay_sec: float) -> None:
+def _run_named(name: str, fn, **kwargs):
+    try:
+        return fn(**kwargs)
+    except Exception as exc:
+        log.exception("%s failed; retrying once in %ss: %s", name, RETRY_SLEEP_SEC, exc)
+        time.sleep(RETRY_SLEEP_SEC)
+        try:
+            return fn(**kwargs)
+        except Exception as retry_exc:
+            log.exception("%s failed again; continuing: %s", name, retry_exc)
+            return None
+
+
+def _scheduled_job(county: str | None, timeout_ms: int, delay_sec: float) -> tuple[object, object]:
     log.info("Cron fired — starting Florida Off Market and Rezzie headless web jobs")
-    run_job(
+    fom = _run_named(
+        "Florida Off Market",
+        run_job,
         headed=False,
         county=county,
         timeout_ms=timeout_ms,
         delay_sec=delay_sec,
     )
-    run_rezzie_job(timeout_ms=timeout_ms)
+    rezzie = _run_named("Rezzie", run_rezzie_job, timeout_ms=timeout_ms)
+    return fom, rezzie
 
 
 def main() -> None:
@@ -63,14 +81,13 @@ def main() -> None:
 
     if args.once:
         try:
-            _scheduled_job(
+            fom, rezzie = _scheduled_job(
                 county=county,
                 timeout_ms=args.timeout,
                 delay_sec=args.delay,
             )
-        except Exception as exc:
-            log.exception("One-shot job failed: %s", exc)
-            sys.exit(1)
+            if fom is None or rezzie is None:
+                sys.exit(1)
         finally:
             close_client()
         return

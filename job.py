@@ -44,6 +44,7 @@ def run_job(
             "filtered": {
                 "inserted": 0,
                 "skipped_recent_address": 0,
+                "skipped_existing_id": 0,
                 "skipped_no_address": 0,
                 "skipped_no_id": 0,
                 "total": 0,
@@ -57,7 +58,7 @@ def run_job(
         limit=limit,
         delay_sec=delay_sec,
     )
-    listings = list(extract_result.get("listings") or [])
+    listings = [item for item in extract_result.get("listings") or [] if not item.get("error")]
     raw_stats = upsert_raw_listings(listings)
     filter_stats = promote_to_filtered(listings)
     log.info("=== daily job done raw=%s filtered=%s ===", raw_stats, filter_stats)
