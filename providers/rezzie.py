@@ -34,12 +34,66 @@ class RezzieProvider(ScraperProvider):
         except Exception:
             return False
 
+    @staticmethod
+    def _is_marketing_home(url: str) -> bool:
+        """True for the public Rezzie homepage, which is not the buyer dashboard."""
+        parts = urlsplit(url or "")
+        host = (parts.netloc or "").lower().split(":")[0]
+        if host not in {"rezzie.com", "www.rezzie.com"}:
+            return False
+        path = (parts.path or "/").rstrip("/") or "/"
+        return path == "/"
+
+    def _dashboard_ready(self, page: Any) -> bool:
+        return page.get_by_role("button", name=re.compile(r"^details$", re.I)).count() > 0
+
+    def _sign_in_visible(self, page: Any) -> bool:
+        button = page.get_by_role("button", name=re.compile(r"^sign\s*in$", re.I))
+        if self._visible(button):
+            return True
+        link = page.get_by_role("link", name=re.compile(r"^sign\s*in$", re.I))
+        return self._visible(link)
+
     def _login_visible(self, page: Any) -> bool:
-        if "/login" in (page.url or "").lower() or self._visible(page.get_by_label(re.compile(r"email", re.I))):
+        # Deal cards mean the saved session already reached the buyer dashboard.
+        if self._dashboard_ready(page):
+            return False
+        if "/login" in (page.url or "").lower() or self._is_marketing_home(page.url or ""):
+            return True
+        if self._visible(page.get_by_label(re.compile(r"email", re.I))):
             return True
         # Rezzie protects the dashboard with an in-page auth guard instead of
         # always redirecting to /login.
-        return self._visible(page.get_by_text(re.compile(r"authentication required", re.I)))
+        if self._visible(page.get_by_text(re.compile(r"authentication required", re.I))):
+            return True
+        return self._sign_in_visible(page)
+
+    def _wait_for_gate(self, page: Any, timeout_ms: int) -> None:
+        """Wait until deals or a sign-in gate have actually painted.
+
+        The buyer app renders after the first document event. Checking too
+        early treats the public homepage as an already-open dashboard.
+        """
+        try:
+            page.wait_for_function(
+                """() => {
+                    const text = (document.body && document.body.innerText) || '';
+                    const path = (location.pathname || '/').replace(/\\/$/, '') || '/';
+                    const host = location.hostname || '';
+                    const home = (host === 'rezzie.com' || host === 'www.rezzie.com') && path === '/';
+                    const auth = /authentication required/i.test(text);
+                    const details = Array.from(document.querySelectorAll('button')).some(
+                        (button) => /^details$/i.test((button.innerText || '').trim())
+                    );
+                    const signIn = Array.from(document.querySelectorAll('a,button')).some(
+                        (node) => /^sign\\s*in$/i.test((node.innerText || '').trim())
+                    );
+                    return home || auth || details || signIn || /\\/login/i.test(location.href);
+                }""",
+                timeout=min(timeout_ms, 15000),
+            )
+        except PlaywrightTimeout:
+            pass
 
     def _credentials(self) -> tuple[str, str]:
         load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -51,6 +105,7 @@ class RezzieProvider(ScraperProvider):
     def authenticate(self, page: Any, timeout_ms: int) -> None:
         if self.dashboard_path not in (page.url or ""):
             page.goto(urljoin(self.base_url, self.dashboard_path), wait_until="domcontentloaded", timeout=timeout_ms)
+        self._wait_for_gate(page, timeout_ms)
         # A restored storage state should get straight through to the dashboard.
         if not self._login_visible(page):
             return
@@ -84,6 +139,7 @@ class RezzieProvider(ScraperProvider):
         except PlaywrightTimeout as exc:
             raise RuntimeError("Rezzie login did not complete; check credentials or run headed for MFA/CAPTCHA") from exc
         page.goto(urljoin(self.base_url, self.dashboard_path), wait_until="domcontentloaded", timeout=timeout_ms)
+        self._wait_for_gate(page, timeout_ms)
         if self._login_visible(page):
             raise RuntimeError("Rezzie redirected back to login; the account may require MFA or approval")
 
@@ -100,6 +156,9 @@ class RezzieProvider(ScraperProvider):
             page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 15000))
         except PlaywrightTimeout:
             pass
+        self._wait_for_gate(page, timeout_ms)
+        if self._login_visible(page):
+            raise RuntimeError("Rezzie is not signed in; refusing to save an empty public page or auth wall")
         self._write_debug_snapshot(page)
         results: dict[str, dict[str, Any]] = {}
         # Rezzie's current dashboard uses JavaScript buttons for its property

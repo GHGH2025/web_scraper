@@ -2,6 +2,7 @@
 
 from db import looks_like_street_address
 from extract_fom import keep_image_url, pick_address, pick_price_text
+from providers.rezzie import RezzieProvider
 from scrape_fom import _is_fom_host, _page_block_reason, login_url_ok
 
 
@@ -30,6 +31,11 @@ def main() -> None:
     assert not looks_like_street_address("")
     assert pick_address("NEW DEAL | MIAMI", "Location\n450 NE 31st St, Miami, FL 33137") == "450 NE 31st St, Miami, FL 33137"
     assert pick_address("NEW DEAL | MIAMI", "no street here") is None
+
+    assert RezzieProvider._is_marketing_home("https://rezzie.com/")
+    assert RezzieProvider._is_marketing_home("https://www.rezzie.com")
+    assert not RezzieProvider._is_marketing_home("https://rezzie.com/buyer/dashboard")
+    assert not RezzieProvider._is_marketing_home("https://rezzie.com/buyer/property/abc")
 
     assert keep_image_url("https://cdn.example/photo.jpg")
     assert not keep_image_url("data:image/gif;base64,xxxx")

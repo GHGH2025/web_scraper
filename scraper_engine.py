@@ -52,13 +52,15 @@ class ScraperEngine:
             context = browser.new_context(**context_options)
             page = context.new_page()
             page.set_default_timeout(self.timeout_ms)
+            signed_in = False
             try:
                 page.goto(self.provider.base_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
                 self.provider.authenticate(page, self.timeout_ms)
-                return self.provider.collect_listings(page, self.timeout_ms, filters)
+                cards = self.provider.collect_listings(page, self.timeout_ms, filters)
+                signed_in = True
+                return cards
             finally:
-                self.session_root.mkdir(parents=True, exist_ok=True)
-                context.storage_state(path=str(self.state_path))
+                self._save_session(context, signed_in)
                 context.close()
                 browser.close()
 
@@ -77,9 +79,11 @@ class ScraperEngine:
             context = browser.new_context(**context_options)
             page = context.new_page()
             page.set_default_timeout(self.timeout_ms)
+            signed_in = False
             try:
                 page.goto(self.provider.base_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
                 self.provider.authenticate(page, self.timeout_ms)
+                signed_in = True
                 extracted: list[dict[str, Any]] = []
                 for item in listings:
                     try:
@@ -96,7 +100,17 @@ class ScraperEngine:
                         extracted.append({**item, "error": str(exc)})
                 return extracted
             finally:
-                self.session_root.mkdir(parents=True, exist_ok=True)
-                context.storage_state(path=str(self.state_path))
+                self._save_session(context, signed_in)
                 context.close()
                 browser.close()
+
+    def _save_session(self, context: Any, signed_in: bool) -> None:
+        """Keep the saved browser session only after a real sign-in.
+
+        A logged-out visit used to overwrite ``.session/rezzie.json``, so the
+        next morning started on the public homepage again.
+        """
+        if not signed_in:
+            return
+        self.session_root.mkdir(parents=True, exist_ok=True)
+        context.storage_state(path=str(self.state_path))
