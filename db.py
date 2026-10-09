@@ -28,8 +28,10 @@ load_dotenv(ROOT / ".env")
 MONGO_URI = (os.getenv("MONGO_URI") or "").strip()
 RAW_COLLECTION = "raw"
 FILTERED_COLLECTION = "filtered"
+JOB_RUNS_COLLECTION = "rezzie_job_runs"
 LOOKBACK_DAYS = 30
 SOURCE = "florida_off_market"
+MAX_JOB_SAMPLE = 25
 
 _ADDR_TAIL_RE = re.compile(
     r"^(?P<street>.+?),\s*(?P<city>.+?),\s*(?P<state>[A-Za-z]{2})"
@@ -81,6 +83,10 @@ def get_filtered_collection() -> Collection:
     return get_db()[FILTERED_COLLECTION]
 
 
+def get_job_runs_collection() -> Collection:
+    return get_db()[JOB_RUNS_COLLECTION]
+
+
 def close_client() -> None:
     global _client
     if _client is not None:
@@ -108,12 +114,19 @@ def ensure_indexes() -> None:
     filtered.create_index([("status", ASCENDING), ("parsed_listing_id", ASCENDING)], name="status_parsed_idx")
     filtered.create_index([("listing_id", ASCENDING)], name="filtered_listing_id_idx")
     filtered.create_index([("posted_at", ASCENDING)], name="filtered_posted_at_idx")
+
+    jobs = get_job_runs_collection()
+    jobs.create_index([("run_at", ASCENDING)], name="rezzie_job_run_at_idx")
+    jobs.create_index([("target_date", ASCENDING)], name="rezzie_job_target_date_idx")
+    jobs.create_index([("source", ASCENDING), ("run_at", ASCENDING)], name="rezzie_job_source_run_at_idx")
     log.info(
-        "Ensured indexes on %s.%s and %s.%s",
+        "Ensured indexes on %s.%s, %s.%s, and %s.%s",
         get_db().name,
         RAW_COLLECTION,
         get_db().name,
         FILTERED_COLLECTION,
+        get_db().name,
+        JOB_RUNS_COLLECTION,
     )
 
 
@@ -264,7 +277,7 @@ def _recent_address_exists(address: str, address_norm_value: str, since: datetim
     )
 
 
-def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE) -> dict[str, int]:
+def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE) -> dict[str, Any]:
     """Queue new web deals only when no same address was created in the last 30 days."""
     now = _now()
     since = now - timedelta(days=LOOKBACK_DAYS)
@@ -275,6 +288,7 @@ def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE)
     skipped_existing_id = 0
     skipped_no_address = 0
     skipped_no_id = 0
+    inserted_listings: list[dict[str, Any]] = []
 
     for listing in listings:
         listing_id = listing.get("listing_id")
@@ -300,6 +314,17 @@ def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE)
         raw_id = raw_doc["_id"] if raw_doc else None
         filtered.insert_one(_filtered_doc(listing, loc, raw_id, now, source))
         inserted += 1
+        if len(inserted_listings) < MAX_JOB_SAMPLE:
+            inserted_listings.append(
+                {
+                    "listing_id": listing_id,
+                    "address": loc["address"],
+                    "city": loc["city"],
+                    "state": loc["state"],
+                    "url": listing.get("url"),
+                    "price": listing.get("price") or listing.get("price_usd"),
+                }
+            )
 
     stats = {
         "inserted": inserted,
@@ -309,6 +334,7 @@ def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE)
         "skipped_no_id": skipped_no_id,
         "total": len(listings),
         "lookback_days": LOOKBACK_DAYS,
+        "inserted_listings": inserted_listings,
     }
     log.info(
         "Mongo filtered %s.%s inserted=%s skipped_recent_address=%s "
@@ -322,3 +348,21 @@ def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE)
         len(listings),
     )
     return stats
+
+
+def persist_rezzie_job_run(result: dict[str, Any]) -> None:
+    """Store one Rezzie daily-job report for the metrics dashboard."""
+    now = _now()
+    doc = dict(result)
+    doc.pop("_id", None)
+    doc.setdefault("source", "rezzie")
+    doc.setdefault("run_at", now)
+    doc.setdefault("created_at", now)
+    get_job_runs_collection().insert_one(doc)
+    log.info(
+        "Persisted rezzie job run target_date=%s ok=%s cards=%s queued=%s",
+        doc.get("target_date"),
+        doc.get("ok"),
+        doc.get("card_count"),
+        (doc.get("queued") or {}).get("inserted"),
+    )
