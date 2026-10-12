@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -14,6 +15,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
 from .base import ScraperProvider
+from .rezzie_auth import issue_session, write_storage
 
 log = logging.getLogger("rezzie")
 
@@ -26,6 +28,7 @@ class RezzieProvider(ScraperProvider):
     listing_href = re.compile(r"/(?:buyer/)?(?:property|properties|listing|listings|deal|deals)/([^/?#]+)", re.I)
     price_re = re.compile(r"\$\s*[\d,]+(?:\.\d{2})?")
     number_re = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
+    _session_ready = False
 
     @staticmethod
     def _visible(locator: Any) -> bool:
@@ -78,9 +81,6 @@ class RezzieProvider(ScraperProvider):
             page.wait_for_function(
                 """() => {
                     const text = (document.body && document.body.innerText) || '';
-                    const path = (location.pathname || '/').replace(/\\/$/, '') || '/';
-                    const host = location.hostname || '';
-                    const home = (host === 'rezzie.com' || host === 'www.rezzie.com') && path === '/';
                     const auth = /authentication required/i.test(text);
                     const details = Array.from(document.querySelectorAll('button')).some(
                         (button) => /^details$/i.test((button.innerText || '').trim())
@@ -88,12 +88,25 @@ class RezzieProvider(ScraperProvider):
                     const signIn = Array.from(document.querySelectorAll('a,button')).some(
                         (node) => /^sign\\s*in$/i.test((node.innerText || '').trim())
                     );
-                    return home || auth || details || signIn || /\\/login/i.test(location.href);
+                    const email = !!document.querySelector('input[type="email"], input[name*="email" i]');
+                    return auth || details || signIn || email || /\\/login/i.test(location.href);
                 }""",
-                timeout=min(timeout_ms, 15000),
+                timeout=min(timeout_ms, 20000),
             )
         except PlaywrightTimeout:
             pass
+        # A logged-out shell can paint before the saved token is applied.
+        # Wait for deal cards before treating that shell as a failed login.
+        if self._login_visible(page) and not self._dashboard_ready(page):
+            try:
+                page.wait_for_function(
+                    """() => Array.from(document.querySelectorAll('button')).some(
+                        (button) => /^details$/i.test((button.innerText || '').trim())
+                    )""",
+                    timeout=min(timeout_ms, 8000),
+                )
+            except PlaywrightTimeout:
+                pass
 
     def _credentials(self) -> tuple[str, str]:
         load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -102,27 +115,62 @@ class RezzieProvider(ScraperProvider):
             raise RuntimeError("REZZIE_EMAIL and REZZIE_PASSWORD must be set in scraper/.env")
         return email, password
 
+    def prepare_session(self, state_path: Path, *, force: bool = False) -> None:
+        """Sign in and replace the tokens stored for the next browser launch.
+
+        One job signs in once. The extract step of that same job reuses the
+        token just written. The next morning signs in again and overwrites it.
+        """
+        self._state_path = Path(state_path)
+        if self._session_ready and not force:
+            log.info("Rezzie token for this run is already fresh")
+            return
+        email, password = self._credentials()
+        session = issue_session(email, password, self._state_path)
+        write_storage(self._state_path, session)
+        self._last_session = session
+        self._session_ready = True
+
     def authenticate(self, page: Any, timeout_ms: int) -> None:
+        self._open_dashboard(page, timeout_ms)
+        if not self._login_visible(page):
+            return
+        log.warning("Rezzie rejected the saved token; signing in again and replacing it")
+        if getattr(self, "_state_path", None):
+            self.prepare_session(self._state_path, force=True)
+            self._push_tokens(page)
+            self._open_dashboard(page, timeout_ms)
+            if not self._login_visible(page):
+                return
+        self._login_via_form(page, timeout_ms)
+
+    def _open_dashboard(self, page: Any, timeout_ms: int) -> None:
         if self.dashboard_path not in (page.url or ""):
             page.goto(urljoin(self.base_url, self.dashboard_path), wait_until="domcontentloaded", timeout=timeout_ms)
         self._wait_for_gate(page, timeout_ms)
-        # A restored storage state should get straight through to the dashboard.
-        if not self._login_visible(page):
+
+    def _push_tokens(self, page: Any) -> None:
+        session = getattr(self, "_last_session", None)
+        if not session:
             return
+        page.evaluate(
+            """(session) => {
+                localStorage.setItem('rezzie_auth_token', session.token);
+                localStorage.setItem('rezzie_refresh_token', session.refreshToken);
+                if (session.userJson) localStorage.setItem('rezzie_user_data', session.userJson);
+                if (session.storeJson) localStorage.setItem('rezzie-auth-store', session.storeJson);
+            }""",
+            {
+                "token": session["token"],
+                "refreshToken": session["refresh_token"],
+                "userJson": session.get("user_json") or "",
+                "storeJson": session.get("store_json") or "",
+            },
+        )
+
+    def _login_via_form(self, page: Any, timeout_ms: int) -> None:
         email, password = self._credentials()
-        email_input = page.get_by_label(re.compile(r"email", re.I))
-        if not self._visible(email_input):
-            # Rezzie presents authentication as a modal from the protected
-            # dashboard instead of navigating to a dedicated /login URL.
-            sign_in = page.get_by_role("button", name=re.compile(r"^sign\s*in$", re.I))
-            if self._visible(sign_in):
-                sign_in.first.click()
-            else:
-                login = page.get_by_role("link", name=re.compile(r"log\s*in|sign\s*in", re.I))
-                if not self._visible(login):
-                    raise RuntimeError("Rezzie requires sign-in but no sign-in control was found")
-                login.first.click()
-            email_input.wait_for(state="visible", timeout=timeout_ms)
+        email_input = self._open_sign_in(page, timeout_ms)
         email_input.first.fill(email)
         page.get_by_label(re.compile(r"password", re.I)).first.fill(password)
         form = page.locator("form").last
@@ -142,6 +190,29 @@ class RezzieProvider(ScraperProvider):
         self._wait_for_gate(page, timeout_ms)
         if self._login_visible(page):
             raise RuntimeError("Rezzie redirected back to login; the account may require MFA or approval")
+
+    def _open_sign_in(self, page: Any, timeout_ms: int) -> Any:
+        """Wait until the email field or a Sign In control has actually painted."""
+        email_input = page.get_by_label(re.compile(r"email", re.I))
+        deadline = time.monotonic() + (timeout_ms / 1000)
+        while time.monotonic() < deadline:
+            if self._visible(email_input):
+                return email_input
+            sign_in = page.get_by_role("button", name=re.compile(r"^sign\s*in$", re.I))
+            if self._visible(sign_in):
+                sign_in.first.click()
+                break
+            login = page.get_by_role("link", name=re.compile(r"log\s*in|sign\s*in", re.I))
+            if self._visible(login):
+                login.first.click()
+                break
+            page.wait_for_timeout(500)
+        remaining_ms = max(1000, int((deadline - time.monotonic()) * 1000))
+        try:
+            email_input.first.wait_for(state="visible", timeout=remaining_ms)
+        except PlaywrightTimeout as exc:
+            raise RuntimeError("Rezzie requires sign-in but no sign-in control was found") from exc
+        return email_input
 
     @staticmethod
     def _clean_url(href: str, base_url: str) -> str:
@@ -195,6 +266,21 @@ class RezzieProvider(ScraperProvider):
         self._warn_if_empty(page, cards)
         return cards
 
+    @staticmethod
+    def _card_text(button: Any) -> str:
+        """Read the card around a Details button without waiting for visibility."""
+        raw = button.evaluate(
+            """(node) => {
+                let card = node;
+                for (let step = 0; step < 3 && card && card.parentElement; step += 1) {
+                    card = card.parentElement;
+                }
+                const text = (card && (card.innerText || card.textContent)) || "";
+                return text.replace(/\\s+/g, " ").trim();
+            }"""
+        )
+        return " ".join(str(raw or "").split())
+
     def _collect_button_listings(
         self,
         page: Any,
@@ -215,8 +301,21 @@ class RezzieProvider(ScraperProvider):
             button_count = page.get_by_role("button", name=re.compile(r"^details$", re.I)).count()
             for index in range(button_count):
                 button = page.get_by_role("button", name=re.compile(r"^details$", re.I)).nth(index)
-                # The card body is three levels above the Details button.
-                card_text = " ".join(button.locator("xpath=../../..").inner_text().split())
+                try:
+                    button.scroll_into_view_if_needed(timeout=3000)
+                except Exception:
+                    log.info("Skipping Rezzie Details button %s; it could not be scrolled into view", index + 1)
+                    continue
+                if not self._visible(button):
+                    log.info("Skipping hidden Rezzie Details button %s", index + 1)
+                    continue
+                # inner_text() waits until the ancestor is visible and can stall
+                # the whole job on a Details control that is not a property card.
+                try:
+                    card_text = self._card_text(button)
+                except Exception:
+                    log.warning("Skipping Rezzie card %s; its text was not readable", index + 1)
+                    continue
                 if filters and any(filters.get(key) and str(filters[key]).lower() not in card_text.lower() for key in ("city", "county", "state")):
                     continue
                 button.click()

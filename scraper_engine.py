@@ -45,13 +45,7 @@ class ScraperEngine:
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=not self.headed)
-            context_options: dict[str, Any] = {"viewport": {"width": 1400, "height": 900}}
-            if self.state_path.exists():
-                context_options["storage_state"] = str(self.state_path)
-            context = browser.new_context(**context_options)
-            page = context.new_page()
-            page.set_default_timeout(self.timeout_ms)
+            browser, context, page = self._open_browser(playwright)
             signed_in = False
             try:
                 page.goto(self.provider.base_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
@@ -72,13 +66,7 @@ class ScraperEngine:
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=not self.headed)
-            context_options: dict[str, Any] = {"viewport": {"width": 1400, "height": 900}}
-            if self.state_path.exists():
-                context_options["storage_state"] = str(self.state_path)
-            context = browser.new_context(**context_options)
-            page = context.new_page()
-            page.set_default_timeout(self.timeout_ms)
+            browser, context, page = self._open_browser(playwright)
             signed_in = False
             try:
                 page.goto(self.provider.base_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
@@ -103,6 +91,24 @@ class ScraperEngine:
                 self._save_session(context, signed_in)
                 context.close()
                 browser.close()
+
+    def _open_browser(self, playwright: Any) -> tuple[Any, Any, Any]:
+        """Launch Chromium after the provider has replaced any saved login."""
+        prepare = getattr(self.provider, "prepare_session", None)
+        if callable(prepare):
+            prepare(self.state_path)
+        browser = playwright.chromium.launch(headless=not self.headed)
+        try:
+            context_options: dict[str, Any] = {"viewport": {"width": 1400, "height": 900}}
+            if self.state_path.exists():
+                context_options["storage_state"] = str(self.state_path)
+            context = browser.new_context(**context_options)
+            page = context.new_page()
+            page.set_default_timeout(self.timeout_ms)
+            return browser, context, page
+        except Exception:
+            browser.close()
+            raise
 
     def _save_session(self, context: Any, signed_in: bool) -> None:
         """Keep the saved browser session only after a real sign-in.

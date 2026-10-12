@@ -51,8 +51,6 @@ log = logging.getLogger("fom")
 
 def setup_logging(log_path: Path) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log.setLevel(logging.DEBUG)
-    log.handlers.clear()
     fmt = logging.Formatter("%(asctime)s %(levelname)-5s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
@@ -60,8 +58,13 @@ def setup_logging(log_path: Path) -> None:
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(logging.INFO)
     console.setFormatter(fmt)
-    log.addHandler(file_handler)
-    log.addHandler(console)
+    for name in ("fom", "rezzie", "rezzie_job"):
+        named = logging.getLogger(name)
+        named.setLevel(logging.DEBUG)
+        named.handlers.clear()
+        named.addHandler(file_handler)
+        named.addHandler(console)
+        named.propagate = False
 
 
 def _is_fom_host(url: str) -> bool:
