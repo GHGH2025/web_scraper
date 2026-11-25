@@ -1,7 +1,7 @@
-"""Keep the scraper process running and fire the Rezzie job at 1:00 AM.
+"""Keep the scraper process running and fire FOM + Rezzie every 10 minutes.
 
 Usage:
-  python scheduler.py              # wait for 1:00 AM America/New_York
+  python scheduler.py              # stay on the every-10-minute cron
   python scheduler.py --now        # run immediately, then stay on the cron
   python scheduler.py --once       # run immediately and exit
 """
@@ -21,6 +21,7 @@ from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
 from db import close_client
+from job import JOB_LOG_PATH, run_job
 from rezzie_job import run_job as run_rezzie_job
 from scrape_fom import ROOT, log, setup_logging
 
@@ -29,6 +30,8 @@ load_dotenv(ROOT / ".env")
 DEFAULT_TZ = "America/New_York"
 SCHEDULER_LOG_PATH = Path(__file__).resolve().parent / "logs" / "scheduler.log"
 RETRY_SLEEP_SEC = 60
+# Rich: a new deal on FOM/Rezzie should reach us within about 10 minutes.
+CRON_MINUTE = "*/10"
 
 
 def _timezone() -> ZoneInfo:
@@ -49,27 +52,45 @@ def _run_named(name: str, fn, **kwargs):
             return None
 
 
-def _scheduled_job(timeout_ms: int) -> object:
-    log.info("Cron fired — starting Rezzie headless web job")
-    return _run_named("Rezzie", run_rezzie_job, timeout_ms=timeout_ms)
+def _scheduled_job(county: str | None, timeout_ms: int, delay_sec: float) -> tuple[object, object]:
+    log.info("Cron fired — starting Florida Off Market and Rezzie headless web jobs")
+    fom = _run_named(
+        "Florida Off Market",
+        run_job,
+        headed=False,
+        county=county,
+        timeout_ms=timeout_ms,
+        delay_sec=delay_sec,
+    )
+    rezzie = _run_named("Rezzie", run_rezzie_job, timeout_ms=timeout_ms)
+    return fom, rezzie
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="APScheduler cron for the Rezzie web job")
-    parser.add_argument("--now", action="store_true", help="Run the job once at startup, then keep the 1 AM cron")
+    parser = argparse.ArgumentParser(
+        description="APScheduler cron for Florida Off Market and Rezzie web jobs (every 10 minutes)"
+    )
+    parser.add_argument("--now", action="store_true", help="Run the job once at startup, then keep the cron")
     parser.add_argument("--once", action="store_true", help="Run the job once and exit (no scheduler)")
+    parser.add_argument("--county", default=None)
     parser.add_argument("--timeout", type=int, default=45000)
+    parser.add_argument("--delay", type=float, default=0.6)
     parser.add_argument("--log-file", default=str(SCHEDULER_LOG_PATH))
     args = parser.parse_args()
 
     setup_logging(Path(args.log_file))
     tz = _timezone()
-    log.info("Scheduler timezone=%s cron=01:00", tz.key)
+    county = (args.county or "").strip() or None
+    log.info("Scheduler timezone=%s cron=minute=%s (FOM + Rezzie)", tz.key, CRON_MINUTE)
 
     if args.once:
         try:
-            rezzie = _scheduled_job(timeout_ms=args.timeout)
-            if rezzie is None:
+            fom, rezzie = _scheduled_job(
+                county=county,
+                timeout_ms=args.timeout,
+                delay_sec=args.delay,
+            )
+            if fom is None and rezzie is None:
                 sys.exit(1)
         finally:
             close_client()
@@ -78,13 +99,18 @@ def main() -> None:
     scheduler = BlockingScheduler(timezone=tz)
     scheduler.add_job(
         _scheduled_job,
-        CronTrigger(hour=1, minute=0, timezone=tz),
-        kwargs={"timeout_ms": args.timeout},
-        id="rezzie_daily_scrape",
+        CronTrigger(minute=CRON_MINUTE, timezone=tz),
+        kwargs={
+            "county": county,
+            "timeout_ms": args.timeout,
+            "delay_sec": args.delay,
+        },
+        id="fom_rezzie_10min_scrape",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
-        misfire_grace_time=3600,
+        # Skip a tick if the previous FOM+Rezzie pass is still running.
+        misfire_grace_time=300,
     )
     next_run = scheduler.get_jobs()[0].trigger.get_next_fire_time(None, datetime.now(tz))
     log.info("Next run: %s", next_run)
@@ -92,11 +118,15 @@ def main() -> None:
     if args.now:
         log.info("--now: running job immediately before waiting for cron")
         try:
-            _scheduled_job(timeout_ms=args.timeout)
+            _scheduled_job(
+                county=county,
+                timeout_ms=args.timeout,
+                delay_sec=args.delay,
+            )
         except Exception as exc:
             log.exception("Startup job failed (scheduler will still keep running): %s", exc)
 
-    log.info("Scheduler started. Daily job log: %s", SCHEDULER_LOG_PATH.resolve())
+    log.info("Scheduler started. Job log: %s / %s", SCHEDULER_LOG_PATH.resolve(), JOB_LOG_PATH.resolve())
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
