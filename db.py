@@ -1,4 +1,4 @@
-"""MongoDB connection for Florida Off Market listings.
+"""MongoDB connection for scraped web listings.
 
 One shared MongoClient for the long-running scheduler. The daily job is
 single-threaded and sequential, so driver pool defaults are used.
@@ -21,7 +21,7 @@ from pymongo.collection import Collection
 from pymongo.database import Database
 from pymongo.errors import ConfigurationError
 
-from scrape_fom import ROOT, log
+from common import ROOT, log
 
 load_dotenv(ROOT / ".env")
 
@@ -30,7 +30,7 @@ RAW_COLLECTION = "raw"
 FILTERED_COLLECTION = "filtered"
 JOB_RUNS_COLLECTION = "rezzie_job_runs"
 LOOKBACK_DAYS = 30
-SOURCE = "florida_off_market"
+SOURCE = "rezzie"
 MAX_JOB_SAMPLE = 25
 
 _ADDR_TAIL_RE = re.compile(
@@ -281,9 +281,9 @@ def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE)
     """Queue new web deals only when no same address was created in the last 30 days.
 
     First-wholesaler (Rich / Judson): the earliest source that created the address
-    in ``filtered`` or ``parsed_listings`` keeps the deal. Later FOM or Rezzie
-    scrapes of the same house are skipped here — no source gets priority to
-    reassign an existing deal. Same ``listing_id`` is also skipped.
+    in ``filtered`` or ``parsed_listings`` keeps the deal. Later scrapes of the
+    same house are skipped here — no source gets priority to reassign an
+    existing deal. Same ``listing_id`` is also skipped.
     """
     now = _now()
     since = now - timedelta(days=LOOKBACK_DAYS)
@@ -312,7 +312,7 @@ def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE)
             skipped_no_address += 1
             continue
 
-        # First source wins — do not queue a later FOM/Rezzie copy of the same address.
+        # First source wins — do not queue a later copy of the same address.
         if _recent_address_exists(loc["address"] or "", key, since):
             skipped_recent_address += 1
             continue
