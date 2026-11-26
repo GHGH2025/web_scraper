@@ -278,7 +278,13 @@ def _recent_address_exists(address: str, address_norm_value: str, since: datetim
 
 
 def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE) -> dict[str, Any]:
-    """Queue new web deals only when no same address was created in the last 30 days."""
+    """Queue new web deals only when no same address was created in the last 30 days.
+
+    First-wholesaler (Rich / Judson): the earliest source that created the address
+    in ``filtered`` or ``parsed_listings`` keeps the deal. Later FOM or Rezzie
+    scrapes of the same house are skipped here — no source gets priority to
+    reassign an existing deal. Same ``listing_id`` is also skipped.
+    """
     now = _now()
     since = now - timedelta(days=LOOKBACK_DAYS)
     raw = get_raw_collection()
@@ -306,6 +312,7 @@ def promote_to_filtered(listings: list[dict[str, Any]], *, source: str = SOURCE)
             skipped_no_address += 1
             continue
 
+        # First source wins — do not queue a later FOM/Rezzie copy of the same address.
         if _recent_address_exists(loc["address"] or "", key, since):
             skipped_recent_address += 1
             continue
