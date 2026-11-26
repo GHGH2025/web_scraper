@@ -35,6 +35,3 @@ To add a website:
 2. Implement the three provider hooks and use a unique `name` and session file.
 3. Register the class in `providers/registry.py`.
 4. Add a provider-specific command/job only when its scraping behavior is ready.
-
-Florida Off Market's current commands remain unchanged while their logic is
-migrated into `FloridaOffMarketProvider` in a follow-up step.

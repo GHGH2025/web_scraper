@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from .base import ScraperProvider
-from .florida_off_market import FloridaOffMarketProvider
 from .rezzie import RezzieProvider
 
 _PROVIDERS: dict[str, type[ScraperProvider]] = {
-    FloridaOffMarketProvider.name: FloridaOffMarketProvider,
     RezzieProvider.name: RezzieProvider,
 }
 
